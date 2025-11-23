@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import axios from 'axios';
 import './FileUpload.css';
 
-const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+const API_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:3001';
 
 const FileUpload = () => {
   const [file, setFile] = useState(null);
