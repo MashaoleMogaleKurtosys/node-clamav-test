@@ -1,0 +1,53 @@
+services:
+  clamav:
+    # Using official ClamAV image with platform emulation for ARM64
+    # mkodockx image has outdated ClamAV version (0.104.3) that can't download virus definitions
+    image: clamav/clamav:latest
+    platform: linux/amd64  # Use x86_64 emulation for ARM64 (Apple Silicon)
+    container_name: clamav-scanner
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav-data:/var/lib/clamav
+    environment:
+      # Enable TCP socket for Docker networking
+      - CLAMD_CONF_TCPSocket=3310
+      - CLAMD_CONF_TCPAddr=0.0.0.0
+      # Logging configuration
+      - CLAMD_CONF_LogFile=/dev/stdout
+      - CLAMD_CONF_LogTime=true
+      - CLAMD_CONF_LogVerbose=true
+      # Performance settings
+      # Increased limits for large files (e.g., large ZIP archives)
+      - CLAMD_CONF_MaxScanSize=5000M
+      - CLAMD_CONF_MaxFileSize=5000M
+      # INSTREAM limit - controls stream scanning size (must be >= MaxFileSize)
+      - CLAMD_CONF_StreamMaxLength=5000M
+      # MaxScanTime - maximum time to scan a single file (default is 120 seconds)
+      # Set to 300 seconds (5 minutes) to match Node.js timeout
+      - CLAMD_CONF_MaxScanTime=300000
+      # Scan all file types
+      - CLAMD_CONF_ScanArchive=true
+      - CLAMD_CONF_ScanPE=true
+      - CLAMD_CONF_ScanELF=true
+      - CLAMD_CONF_ScanOLE2=true
+      - CLAMD_CONF_ScanPDF=true
+      - CLAMD_CONF_ScanHTML=true
+      - CLAMD_CONF_ScanMail=true
+      - CLAMD_CONF_DisableCache=true
+      # Note: ClamAV doesn't cache scan results by default
+      # Each scan is processed fresh based on file content
+      # We ensure uniqueness in code by creating fresh buffer copies and unique temp file paths
+    healthcheck:
+      # Check if clamd is actually listening on port 3310
+      test: ["CMD-SHELL", "nc -z localhost 3310 && clamdscan --version > /dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s  # Increased for virus definition download (5 minutes)
+    restart: unless-stopped
+
+volumes:
+  clamav-data:
+    driver: local
+
