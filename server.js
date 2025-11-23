@@ -304,9 +304,14 @@ app.post('/upload', upload.single('document'), async (req, res) => {
     if (ENABLE_VIRUS_SCAN) {
       // Scanning enabled - scan the file buffer
       console.log(`Scanning file: ${req.file.originalname} (${(fileSize / 1024).toFixed(2)} KB)`);
+      
+      // Measure the actual scan duration from start to finish
+      const actualScanStartTime = Date.now();
       const scanResult = await scanFile(req.file.buffer, fileSize);
+      const actualScanDuration = Date.now() - actualScanStartTime;
       
       // Prepare response with all performance metrics
+      // Use the actual measured duration instead of the internal scanDuration
       responseData = {
         success: !scanResult.isInfected,
         message: scanResult.isInfected ? 'File is infected' : 'File is clean and safe',
@@ -316,21 +321,21 @@ app.post('/upload', upload.single('document'), async (req, res) => {
         scanMethod: scanResult.method,
         fileSize: fileSize,
         fileSizeFormatted: formatFileSize(fileSize),
-        // Performance metrics
+        // Performance metrics - use actual measured duration
         streamProcessingTime: scanResult.streamProcessingTime || 0,
         streamProcessingTimeFormatted: formatDuration(scanResult.streamProcessingTime || 0),
-        scanDuration: scanResult.scanDuration,
-        scanDurationFormatted: formatDuration(scanResult.scanDuration),
-        totalDuration: scanResult.totalDuration || scanResult.scanDuration,
-        totalDurationFormatted: formatDuration(scanResult.totalDuration || scanResult.scanDuration)
+        scanDuration: actualScanDuration, // Use actual measured duration
+        scanDurationFormatted: formatDuration(actualScanDuration),
+        totalDuration: actualScanDuration,
+        totalDurationFormatted: formatDuration(actualScanDuration)
       };
 
       if (scanResult.isInfected) {
         responseData.viruses = scanResult.viruses;
-        console.log(`File infected: ${req.file.originalname} (${formatFileSize(fileSize)}) - Stream: ${formatDuration(scanResult.streamProcessingTime || 0)}, Scan: ${formatDuration(scanResult.scanDuration)}, Total: ${formatDuration(scanResult.totalDuration || scanResult.scanDuration)}`);
+        console.log(`File infected: ${req.file.originalname} (${formatFileSize(fileSize)}) - Scan Duration: ${formatDuration(actualScanDuration)}`);
         return res.status(400).json(responseData);
       } else {
-        console.log(`File clean: ${req.file.originalname} (${formatFileSize(fileSize)}) - Stream: ${formatDuration(scanResult.streamProcessingTime || 0)}, Scan: ${formatDuration(scanResult.scanDuration)}, Total: ${formatDuration(scanResult.totalDuration || scanResult.scanDuration)}`);
+        console.log(`File clean: ${req.file.originalname} (${formatFileSize(fileSize)}) - Scan Duration: ${formatDuration(actualScanDuration)}`);
         return res.status(200).json(responseData);
       }
     } else {
