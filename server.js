@@ -287,10 +287,13 @@ const scanWithStream = async (fileBuffer, requestId = '') => {
 
 // Main scanning function - accepts file buffer
 // Uses stream scanning only (no fallback)
-const scanFile = async (fileBuffer, fileSize, requestId = '') => {
+// Retries on EPIPE errors with fresh connection
+const scanFile = async (fileBuffer, fileSize, requestId = '', retryCount = 0) => {
+  const maxRetries = 2;
+  
   try {
     // Use stream scanning (via TCP)
-    console.log(`[${requestId}] Scanning file via stream... (${(fileSize / 1024).toFixed(2)} KB)`);
+    console.log(`[${requestId}] Scanning file via stream... (${(fileSize / 1024).toFixed(2)} KB)${retryCount > 0 ? ` [Retry ${retryCount}/${maxRetries}]` : ''}`);
     const result = await scanWithStream(fileBuffer, requestId);
     
     // Check if we got "UNKNOWN COMMAND" error
@@ -303,7 +306,15 @@ const scanFile = async (fileBuffer, fileSize, requestId = '') => {
       fileSize: fileSize
     };
   } catch (error) {
-    console.error('Stream scan failed:', error.message);
+    // Retry on EPIPE/ECONNRESET errors (connection issues)
+    if ((error.code === 'EPIPE' || error.code === 'ECONNRESET') && retryCount < maxRetries) {
+      console.warn(`[${requestId}] Connection error (${error.code}), retrying with fresh connection... (attempt ${retryCount + 1}/${maxRetries})`);
+      // Wait a bit before retrying
+      await new Promise(resolve => setTimeout(resolve, 1000 * (retryCount + 1)));
+      return scanFile(fileBuffer, fileSize, requestId, retryCount + 1);
+    }
+    
+    console.error(`[${requestId}] Stream scan failed:`, error.message, error.code);
     throw error;
   }
 };
@@ -411,6 +422,21 @@ app.post('/upload', upload.single('document'), async (req, res) => {
     }
   }
 
+  // Format file size helper (needed in try and catch blocks)
+  const formatFileSize = (bytes) => {
+    if (bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  };
+  
+  // Format duration helper (needed in try and catch blocks)
+  const formatDuration = (ms) => {
+    if (ms < 1000) return `${ms}ms`;
+    return `${(ms / 1000).toFixed(2)}s`;
+  };
+
   try {
     // Get file size from buffer
     const fileSize = req.file.size || req.file.buffer.length;
@@ -421,21 +447,6 @@ app.post('/upload', upload.single('document'), async (req, res) => {
       fileSize: `${(fileSize / 1024 / 1024).toFixed(2)} MB`,
       uploadDuration: `${(uploadDuration / 1000).toFixed(2)}s`
     });
-    
-    // Format file size
-    const formatFileSize = (bytes) => {
-      if (bytes === 0) return '0 Bytes';
-      const k = 1024;
-      const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-      const i = Math.floor(Math.log(bytes) / Math.log(k));
-      return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
-    };
-    
-    // Format duration
-    const formatDuration = (ms) => {
-      if (ms < 1000) return `${ms}ms`;
-      return `${(ms / 1000).toFixed(2)}s`;
-    };
     
     // Warn if file is empty
     if (fileSize === 0) {
