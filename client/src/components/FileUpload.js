@@ -29,19 +29,42 @@ const FileUpload = () => {
     }
 
     setUploading(true);
-    setMessage('Uploading and scanning file...');
+    setMessage(`Uploading ${(file.size / 1024 / 1024).toFixed(2)} MB file...`);
     setMessageType('info');
     setScanResult(null);
 
     const formData = new FormData();
     formData.append('document', file);
 
+    const uploadStartTime = Date.now();
+    const fileSizeMB = (file.size / 1024 / 1024).toFixed(2);
+
     try {
+      // Increase timeout for large files: 5 minutes (300000ms) to match server
+      const timeout = 300000; // 5 minutes
+      
+      console.log(`[Upload] Starting upload: ${file.name} (${fileSizeMB} MB)`);
+      
       const response = await axios.post(`${API_URL}/upload`, formData, {
         headers: { 
           'Content-Type': 'multipart/form-data' 
         },
-        timeout: 120000 // 2 minutes timeout for large files
+        timeout: timeout,
+        // Track upload progress
+        onUploadProgress: (progressEvent) => {
+          if (progressEvent.total) {
+            const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+            const uploadedMB = (progressEvent.loaded / 1024 / 1024).toFixed(2);
+            setMessage(`Uploading... ${percentCompleted}% (${uploadedMB} MB / ${fileSizeMB} MB)`);
+            console.log(`[Upload] Progress: ${percentCompleted}% (${uploadedMB} MB)`);
+          }
+        }
+      });
+      
+      const totalDuration = Date.now() - uploadStartTime;
+      console.log(`[Upload] Completed in ${(totalDuration / 1000).toFixed(2)}s`, {
+        requestId: response.data.requestId,
+        totalDuration: response.data.totalDurationFormatted
       });
 
       setUploading(false);
@@ -55,8 +78,13 @@ const FileUpload = () => {
           scanMethod: response.data.scanMethod,
           fileSize: response.data.fileSize,
           fileSizeFormatted: response.data.fileSizeFormatted,
+          uploadDuration: response.data.uploadDuration,
+          uploadDurationFormatted: response.data.uploadDurationFormatted,
           scanDuration: response.data.scanDuration,
-          scanDurationFormatted: response.data.scanDurationFormatted
+          scanDurationFormatted: response.data.scanDurationFormatted,
+          totalDuration: response.data.totalDuration,
+          totalDurationFormatted: response.data.totalDurationFormatted,
+          requestId: response.data.requestId
         });
       } else {
         setMessage(response.data.message);
@@ -69,36 +97,79 @@ const FileUpload = () => {
             fileSize: response.data.fileSize,
             fileSizeFormatted: response.data.fileSizeFormatted,
             scanDuration: response.data.scanDuration,
-            scanDurationFormatted: response.data.scanDurationFormatted
+            scanDurationFormatted: response.data.scanDurationFormatted,
+            requestId: response.data.requestId
           });
         }
       }
     } catch (error) {
       setUploading(false);
+      const errorDuration = Date.now() - uploadStartTime;
+      
+      console.error('[Upload] Error occurred:', {
+        error: error.message,
+        code: error.code,
+        duration: `${(errorDuration / 1000).toFixed(2)}s`,
+        stage: error.response?.data?.stage || 'unknown'
+      });
       
       if (error.response) {
         // Server responded with error
-        setMessage(error.response.data.message || 'Error uploading file');
+        const errorData = error.response.data;
+        const requestId = errorData.requestId || 'unknown';
+        
+        let errorMessage = errorData.message || 'Error uploading file';
+        
+        // Provide specific error messages based on error type
+        if (errorData.stage === 'connection_error') {
+          errorMessage = `Connection to virus scanner lost. This may happen with very large files. Request ID: ${requestId}`;
+        } else if (errorData.stage === 'timeout_error') {
+          errorMessage = `Upload/scan timed out after ${(errorDuration / 1000 / 60).toFixed(1)} minutes. Large files may take longer. Request ID: ${requestId}`;
+        } else if (errorData.stage === 'upload_timeout') {
+          errorMessage = `Upload timed out. The file may be too large or network connection is slow. Request ID: ${requestId}`;
+        } else if (errorData.stage === 'scan_failed') {
+          errorMessage = `Virus scan failed: ${errorData.error || 'Unknown error'}. Request ID: ${requestId}`;
+        } else if (error.response.status === 503) {
+          errorMessage = `Virus scanner is not available. ClamAV may be starting up. Request ID: ${requestId}`;
+        }
+        
+        setMessage(errorMessage);
         setMessageType('error');
-        if (error.response.data.viruses) {
+        
+        if (errorData.viruses) {
           setScanResult({
             infected: true,
-            viruses: error.response.data.viruses,
-            scanMethod: error.response.data.scanMethod,
-            fileSize: error.response.data.fileSize,
-            fileSizeFormatted: error.response.data.fileSizeFormatted,
-            scanDuration: error.response.data.scanDuration,
-            scanDurationFormatted: error.response.data.scanDurationFormatted
+            viruses: errorData.viruses,
+            scanMethod: errorData.scanMethod,
+            fileSize: errorData.fileSize,
+            fileSizeFormatted: errorData.fileSizeFormatted,
+            scanDuration: errorData.scanDuration,
+            scanDurationFormatted: errorData.scanDurationFormatted,
+            requestId: requestId
           });
         }
-      } else if (error.request) {
-        // Request made but no response
-        setMessage('Unable to connect to server. Please ensure the backend is running.');
+      } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+        // Request timeout
+        const timeoutMinutes = (300000 / 1000 / 60).toFixed(1); // 5 minutes
+        setMessage(`Request timed out after ${timeoutMinutes} minutes. The file may be too large or the server is taking longer than expected. Please check server logs or try again with a smaller file.`);
         setMessageType('error');
+        console.error('[Upload] Timeout error:', {
+          duration: `${(errorDuration / 1000).toFixed(2)}s`,
+          fileSize: fileSizeMB + ' MB'
+        });
+      } else if (error.request) {
+        // Request made but no response - network/server issue
+        setMessage(`Unable to connect to server. The server may be down or unreachable. Please check that the server is running and try again.`);
+        setMessageType('error');
+        console.error('[Upload] No response from server:', {
+          url: `${API_URL}/upload`,
+          duration: `${(errorDuration / 1000).toFixed(2)}s`
+        });
       } else {
         // Something else happened
-        setMessage('An unexpected error occurred: ' + error.message);
+        setMessage(`An unexpected error occurred: ${error.message}. Please try again or contact support.`);
         setMessageType('error');
+        console.error('[Upload] Unexpected error:', error);
       }
     }
   };
