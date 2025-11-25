@@ -157,13 +157,34 @@ const FileUpload = () => {
           duration: `${(errorDuration / 1000).toFixed(2)}s`,
           fileSize: fileSizeMB + ' MB'
         });
+      } else if (error.code === 'ERR_BLOCKED_BY_CLIENT' || 
+                 error.message?.includes('ERR_BLOCKED_BY_CLIENT') ||
+                 (error.code === 'ERR_NETWORK' && errorDuration < 0.1)) {
+        // Browser extension or security software blocking the request
+        // ERR_NETWORK with very short duration (<0.1s) usually indicates blocking
+        setMessage(`⚠️ Request was blocked by a browser extension or security software. Please: 1) Disable ad blockers (uBlock Origin, AdBlock Plus), 2) Disable privacy extensions (Privacy Badger, Ghostery), 3) Try incognito/private mode, or 4) Whitelist ${API_URL} in your extensions.`);
+        setMessageType('error');
+        console.error('[Upload] Request blocked by client:', {
+          code: error.code,
+          message: error.message,
+          url: `${API_URL}/upload`,
+          duration: `${(errorDuration / 1000).toFixed(2)}s`,
+          hint: 'This is usually caused by browser extensions blocking the request. Try disabling extensions or using incognito mode.'
+        });
       } else if (error.request) {
         // Request made but no response - network/server issue
-        setMessage(`Unable to connect to server. The server may be down or unreachable. Please check that the server is running and try again.`);
+        // Check if it's a network error vs server down
+        if (error.code === 'ERR_NETWORK' || error.message?.includes('Network Error')) {
+          setMessage(`Network error: Unable to connect to server at ${API_URL}. Please check: 1) Server is running (test: curl ${API_URL}/health), 2) No firewall blocking the connection, 3) Browser extensions are not blocking requests, 4) CORS is properly configured.`);
+        } else {
+          setMessage(`Unable to connect to server. The server may be down or unreachable. Please check that the server is running at ${API_URL} and try again.`);
+        }
         setMessageType('error');
         console.error('[Upload] No response from server:', {
           url: `${API_URL}/upload`,
-          duration: `${(errorDuration / 1000).toFixed(2)}s`
+          duration: `${(errorDuration / 1000).toFixed(2)}s`,
+          code: error.code,
+          message: error.message
         });
       } else {
         // Something else happened
