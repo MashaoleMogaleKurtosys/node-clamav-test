@@ -14,8 +14,13 @@ const ENABLE_VIRUS_SCAN = true;
 const CLAMAV_HOST ='127.0.0.1';
 const CLAMAV_PORT = 4000;
 
-// Enable CORS for React frontend
-app.use(cors());
+// Enable CORS - allow all domains/origins
+app.use(cors({
+  origin: '*', // Allow all origins
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  // allowedHeaders not specified - allows all headers by default
+  credentials: false // Set to false when using origin: '*'
+}));
 app.use(express.json());
 
 // Set default timeout middleware for all requests (5 minutes)
@@ -40,75 +45,174 @@ const upload = multer({
   }
 });
 
-// Initialize ClamScan with fallback options
-let clamscanInstance = null;
-
-// Retry initialization with exponential backoff
-const initClamScanWithRetry = async (maxRetries = 10, delay = 3000) => {
-  if (clamscanInstance) {
-    return clamscanInstance;
+// Connection pool per worker to prevent EPIPE errors with PM2 cluster mode
+class ClamAVConnectionPool {
+  constructor(maxConnections = 5, maxQueueSize = 20) {
+    this.pool = [];
+    this.inUse = new Set();
+    this.maxConnections = maxConnections;
+    this.queue = [];
+    this.maxQueueSize = maxQueueSize;
+    this.initialized = false;
   }
 
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      // Explicit TCP connection config for Docker ClamAV container
-      const clamscan = await new NodeClam().init({
-        clamdscan: {
-          host: CLAMAV_HOST,
-          port: parseInt(CLAMAV_PORT),
-          timeout: 300000, // 5 minutes for large files
-        },
-        preference: {
-          clamdscan: ['host', 'port'],
-        },
-      });
-
-      clamscanInstance = clamscan;
-      console.log(`✅ ClamAV initialized successfully (${CLAMAV_HOST}:${CLAMAV_PORT})`);
-      return clamscan;
-    } catch (error) {
-      if (attempt < maxRetries) {
-        const waitTime = delay * attempt;
-        console.log(`⚠️  ClamAV connection attempt ${attempt}/${maxRetries} failed, retrying in ${waitTime/1000}s...`);
-        console.log(`   Trying to connect to ${CLAMAV_HOST}:${CLAMAV_PORT}`);
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      } else {
-        console.error('❌ Failed to initialize ClamAV after', maxRetries, 'attempts');
-        console.error('   Make sure ClamAV Docker container is running: docker-compose up -d');
-        console.error('   Check ClamAV logs: docker-compose logs clamav');
-        throw error;
+  async _createConnection() {
+    const maxRetries = 10;
+    const delay = 3000;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const clamscan = await new NodeClam().init({
+          clamdscan: {
+            host: CLAMAV_HOST,
+            port: parseInt(CLAMAV_PORT),
+            timeout: 300000, // 5 minutes for large files
+          },
+          preference: {
+            clamdscan: ['host', 'port'],
+          },
+        });
+        
+        if (!this.initialized) {
+          console.log(`✅ ClamAV connection pool initialized (${CLAMAV_HOST}:${CLAMAV_PORT})`);
+          this.initialized = true;
+        }
+        
+        return clamscan;
+      } catch (error) {
+        if (attempt < maxRetries) {
+          const waitTime = delay * attempt;
+          console.log(`⚠️  ClamAV connection attempt ${attempt}/${maxRetries} failed, retrying in ${waitTime/1000}s...`);
+          console.log(`   Trying to connect to ${CLAMAV_HOST}:${CLAMAV_PORT}`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        } else {
+          console.error('❌ Failed to create ClamAV connection after', maxRetries, 'attempts');
+          console.error('   Make sure ClamAV Docker container is running: docker-compose up -d');
+          console.error('   Check ClamAV logs: docker-compose logs clamav');
+          throw error;
+        }
       }
     }
   }
-};
 
-const initClamScan = () => initClamScanWithRetry();
+  async acquire() {
+    return new Promise((resolve, reject) => {
+      // Try to get available connection
+      let conn = this.pool.find(c => !this.inUse.has(c));
+      
+      if (conn) {
+        this.inUse.add(conn);
+        resolve(conn);
+        return;
+      }
+
+      // Create new connection if under limit
+      if (this.pool.length < this.maxConnections) {
+        this._createConnection()
+          .then(conn => {
+            this.pool.push(conn);
+            this.inUse.add(conn);
+            resolve(conn);
+          })
+          .catch(reject);
+        return;
+      }
+
+      // Queue request if pool is full
+      if (this.queue.length >= this.maxQueueSize) {
+        reject(new Error('Connection pool queue is full. Too many concurrent scan requests.'));
+        return;
+      }
+
+      this.queue.push({ resolve, reject });
+    });
+  }
+
+  release(conn) {
+    this.inUse.delete(conn);
+    
+    // Process queued requests
+    if (this.queue.length > 0) {
+      const { resolve } = this.queue.shift();
+      this.inUse.add(conn);
+      resolve(conn);
+    }
+  }
+
+  // Remove bad connection from pool (e.g., after EPIPE error)
+  removeConnection(conn) {
+    this.inUse.delete(conn);
+    const index = this.pool.indexOf(conn);
+    if (index > -1) {
+      this.pool.splice(index, 1);
+      console.log(`⚠️  Removed bad ClamAV connection from pool. Pool size: ${this.pool.length}/${this.maxConnections}`);
+    }
+  }
+
+  // Check if pool is ready
+  isReady() {
+    return this.initialized || this.pool.length > 0;
+  }
+}
+
+// One connection pool per PM2 worker
+const connectionPool = new ClamAVConnectionPool(5, 20);
+
+// Initialize at least one connection on startup
+const initClamScan = async () => {
+  try {
+    await connectionPool._createConnection().then(conn => {
+      connectionPool.pool.push(conn);
+    });
+  } catch (error) {
+    console.error('Failed to initialize ClamAV connection pool:', error);
+    console.warn('⚠️  ClamAV is not available. Server will start but scanning may not work until ClamAV is available.');
+  }
+};
 
 // Fast scanning using scanStream (recommended for performance)
 // Accepts a buffer and creates a stream from it
-const scanWithStream = async (fileBuffer) => {
-  return new Promise((resolve, reject) => {
-    // Time stream creation/processing
-    const streamStartTime = Date.now();
+// Creates a fresh connection per request to avoid EPIPE errors with PM2 cluster mode
+const scanWithStream = async (fileBuffer, requestId = '') => {
+  let conn = null;
+  
+  try {
+    // Acquire connection from pool (or create new one)
+    conn = await connectionPool.acquire();
     
-    // Create a readable stream from the buffer
-    const fileStream = Readable.from(fileBuffer);
-    
-    const streamProcessingTime = Date.now() - streamStartTime;
-    
-    // Time the actual scan
-    const scanStartTime = Date.now();
-    
-    // scanStream: Pass the file stream directly
-    clamscanInstance.scanStream(fileStream, (err, object) => {
-      const scanDuration = Date.now() - scanStartTime;
-      const totalDuration = Date.now() - streamStartTime;
+    return new Promise((resolve, reject) => {
+      // Time stream creation/processing
+      const streamStartTime = Date.now();
       
-      if (err) {
-        console.error('scanStream error:', err);
-        reject(err);
-        return;
-      }
+      // Create a readable stream from the buffer
+      const fileStream = Readable.from(fileBuffer);
+      
+      const streamProcessingTime = Date.now() - streamStartTime;
+      
+      // Time the actual scan
+      const scanStartTime = Date.now();
+      
+      // scanStream: Pass the file stream directly
+      conn.scanStream(fileStream, (err, object) => {
+        const scanDuration = Date.now() - scanStartTime;
+        const totalDuration = Date.now() - streamStartTime;
+        
+        // Always release connection back to pool
+        if (conn) {
+          connectionPool.release(conn);
+        }
+        
+        if (err) {
+          // If EPIPE or connection error, remove bad connection from pool
+          if (err.code === 'EPIPE' || err.code === 'ECONNRESET') {
+            console.error(`[${requestId}] scanStream EPIPE/ECONNRESET error - removing bad connection:`, err.message);
+            connectionPool.removeConnection(conn);
+          } else {
+            console.error(`[${requestId}] scanStream error:`, err.message, err.code);
+          }
+          reject(err);
+          return;
+        }
       
       // Check for "UNKNOWN COMMAND" error - this means stream scanning isn't working over TCP
       if (object && object.resultString === 'UNKNOWN COMMAND') {
@@ -159,28 +263,35 @@ const scanWithStream = async (fileBuffer) => {
         viruses.push('Threat detected');
       }
       
-      console.log(`Stream infection check - isInfected: ${isInfected}, viruses count: ${viruses.length}`);
-      
-      resolve({
-        isInfected,
-        viruses,
-        method: 'clamdscan (stream)', // Uses ClamAV daemon via TCP
-        streamProcessingTime: streamProcessingTime,
-        scanDuration: scanDuration,
-        totalDuration: totalDuration,
-        rawResult: object // Include raw result for debugging
+        console.log(`[${requestId}] Stream infection check - isInfected: ${isInfected}, viruses count: ${viruses.length}`);
+        
+        resolve({
+          isInfected,
+          viruses,
+          method: 'clamdscan (stream)', // Uses ClamAV daemon via TCP
+          streamProcessingTime: streamProcessingTime,
+          scanDuration: scanDuration,
+          totalDuration: totalDuration,
+          rawResult: object // Include raw result for debugging
+        });
       });
     });
-  });
+  } catch (error) {
+    // Release connection if we got it but failed before scan
+    if (conn) {
+      connectionPool.release(conn);
+    }
+    throw error;
+  }
 };
 
 // Main scanning function - accepts file buffer
 // Uses stream scanning only (no fallback)
-const scanFile = async (fileBuffer, fileSize) => {
+const scanFile = async (fileBuffer, fileSize, requestId = '') => {
   try {
     // Use stream scanning (via TCP)
-    console.log(`Scanning file via stream... (${(fileSize / 1024).toFixed(2)} KB)`);
-    const result = await scanWithStream(fileBuffer);
+    console.log(`[${requestId}] Scanning file via stream... (${(fileSize / 1024).toFixed(2)} KB)`);
+    const result = await scanWithStream(fileBuffer, requestId);
     
     // Check if we got "UNKNOWN COMMAND" error
     if (result.needsFallback || (result.rawResult && result.rawResult.resultString === 'UNKNOWN COMMAND')) {
@@ -213,12 +324,32 @@ initClamScan().catch(err => {
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok',
-    clamavReady: clamscanInstance !== null 
+    clamavReady: connectionPool.isReady(),
+    poolSize: connectionPool.pool.length,
+    connectionsInUse: connectionPool.inUse.size,
+    queueLength: connectionPool.queue.length
   });
 });
 
 // Upload and scan endpoint
 app.post('/upload', upload.single('document'), async (req, res) => {
+  // Generate request ID for tracking
+  const requestId = `req-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const requestStartTime = Date.now();
+  
+  // Helper function for logging with request ID
+  const log = (level, message, data = {}) => {
+    const timestamp = new Date().toISOString();
+    const logData = { requestId, timestamp, ...data };
+    console[level](`[${requestId}] ${message}`, Object.keys(logData).length > 2 ? logData : '');
+  };
+
+  log('log', '📥 Upload request received', {
+    ip: req.ip,
+    userAgent: req.get('user-agent'),
+    contentType: req.get('content-type')
+  });
+
   // Set request and response timeout to 5 minutes for large file processing
   // Must set both req and res timeouts, and do it early
   if (req.socket) {
@@ -229,25 +360,52 @@ app.post('/upload', upload.single('document'), async (req, res) => {
   // Set headers to keep connection alive for long-running scans
   res.setHeader('Connection', 'keep-alive');
   
+  // Handle request timeout
+  req.on('timeout', () => {
+    log('error', '⏱️  Request timeout after 5 minutes');
+    if (!res.headersSent) {
+      res.status(408).json({
+        success: false,
+        requestId,
+        message: 'Request timeout. Large file uploads may take longer than 5 minutes.',
+        error: 'Request timeout',
+        stage: 'upload_timeout'
+      });
+    }
+  });
+
+  // Handle client disconnect
+  req.on('close', () => {
+    const duration = Date.now() - requestStartTime;
+    log('warn', '⚠️  Client disconnected before request completed', { duration: `${(duration / 1000).toFixed(2)}s` });
+  });
+
   if (!req.file) {
+    log('warn', '❌ No file uploaded');
     return res.status(400).json({ 
       success: false,
-      message: 'No file uploaded' 
+      requestId,
+      message: 'No file uploaded',
+      error: 'No file provided'
     });
   }
 
   // Initialize ClamAV only if scanning is enabled
   if (ENABLE_VIRUS_SCAN) {
-    if (!clamscanInstance) {
+    if (!connectionPool.isReady()) {
+      log('log', '🔄 ClamAV not ready, initializing connection pool...');
       try {
-        // Try to initialize with more retries and longer delays
-        await initClamScanWithRetry(10, 3000); // 10 retries, 3s initial delay
+        await initClamScan();
+        log('log', '✅ ClamAV connection pool initialized');
       } catch (error) {
+        log('error', '❌ Failed to initialize ClamAV', { error: error.message });
         return res.status(503).json({ 
           success: false,
+          requestId,
           message: 'Virus scanner is not available. ClamAV may still be starting up or virus definitions are downloading. Please wait a few minutes and try again.',
           error: error.message,
-          hint: 'Check ClamAV logs: docker-compose logs clamav'
+          hint: 'Check ClamAV logs: docker-compose logs clamav',
+          stage: 'clamav_init_failed'
         });
       }
     }
@@ -256,6 +414,13 @@ app.post('/upload', upload.single('document'), async (req, res) => {
   try {
     // Get file size from buffer
     const fileSize = req.file.size || req.file.buffer.length;
+    const uploadDuration = Date.now() - requestStartTime;
+    
+    log('log', '📦 File received', {
+      fileName: req.file.originalname,
+      fileSize: `${(fileSize / 1024 / 1024).toFixed(2)} MB`,
+      uploadDuration: `${(uploadDuration / 1000).toFixed(2)}s`
+    });
     
     // Format file size
     const formatFileSize = (bytes) => {
@@ -274,11 +439,13 @@ app.post('/upload', upload.single('document'), async (req, res) => {
     
     // Warn if file is empty
     if (fileSize === 0) {
-      console.warn(`⚠️  WARNING: File ${req.file.originalname} is 0 bytes! This may indicate an upload problem.`);
+      log('warn', '⚠️  File is 0 bytes - upload may have failed', { fileName: req.file.originalname });
       return res.status(400).json({
         success: false,
+        requestId,
         message: 'File is empty (0 bytes). Please check your file upload.',
-        error: 'File size is 0 bytes'
+        error: 'File size is 0 bytes',
+        stage: 'validation_failed'
       });
     }
     
@@ -286,16 +453,22 @@ app.post('/upload', upload.single('document'), async (req, res) => {
     const MAX_FILE_SIZE_FOR_SCAN = 2147483647; // Maximum 32-bit signed integer (2GB - 1 byte)
     if (ENABLE_VIRUS_SCAN && fileSize > MAX_FILE_SIZE_FOR_SCAN) {
       const maxSizeFormatted = formatFileSize(MAX_FILE_SIZE_FOR_SCAN);
-      console.warn(`⚠️  WARNING: File ${req.file.originalname} (${formatFileSize(fileSize)}) exceeds maximum scannable size of ${maxSizeFormatted}`);
+      log('warn', '⚠️  File exceeds maximum scannable size', {
+        fileName: req.file.originalname,
+        fileSize: formatFileSize(fileSize),
+        maxSize: maxSizeFormatted
+      });
       return res.status(400).json({
         success: false,
+        requestId,
         message: `File size (${formatFileSize(fileSize)}) exceeds maximum scannable size of ${maxSizeFormatted}`,
         error: 'File too large for virus scanning',
         fileSize: fileSize,
         fileSizeFormatted: formatFileSize(fileSize),
         maxScannableSize: MAX_FILE_SIZE_FOR_SCAN,
         maxScannableSizeFormatted: maxSizeFormatted,
-        hint: 'The clamscan library has a 2GB limit due to 32-bit integer constraints. Files larger than 2GB cannot be scanned via stream. Set ENABLE_VIRUS_SCAN=false to upload without scanning.'
+        hint: 'The clamscan library has a 2GB limit due to 32-bit integer constraints. Files larger than 2GB cannot be scanned via stream. Set ENABLE_VIRUS_SCAN=false to upload without scanning.',
+        stage: 'validation_failed'
       });
     }
     
@@ -303,12 +476,39 @@ app.post('/upload', upload.single('document'), async (req, res) => {
     
     if (ENABLE_VIRUS_SCAN) {
       // Scanning enabled - scan the file buffer
-      console.log(`Scanning file: ${req.file.originalname} (${(fileSize / 1024).toFixed(2)} KB)`);
-      const scanResult = await scanFile(req.file.buffer, fileSize);
+      const scanStartTime = Date.now();
+      log('log', '🔍 Starting virus scan', {
+        fileName: req.file.originalname,
+        fileSize: `${(fileSize / 1024 / 1024).toFixed(2)} MB`
+      });
+      
+      let scanResult;
+      try {
+        scanResult = await scanFile(req.file.buffer, fileSize, requestId);
+        const scanDuration = Date.now() - scanStartTime;
+        log('log', '✅ Virus scan completed', {
+          fileName: req.file.originalname,
+          scanDuration: `${(scanDuration / 1000).toFixed(2)}s`,
+          infected: scanResult.isInfected,
+          virusesFound: scanResult.viruses?.length || 0
+        });
+      } catch (scanError) {
+        const scanDuration = Date.now() - scanStartTime;
+        log('error', '❌ Virus scan failed', {
+          fileName: req.file.originalname,
+          scanDuration: `${(scanDuration / 1000).toFixed(2)}s`,
+          error: scanError.message,
+          errorCode: scanError.code,
+          stage: 'scan_failed'
+        });
+        throw scanError;
+      }
       
       // Prepare response with all performance metrics
+      const totalRequestDuration = Date.now() - requestStartTime;
       responseData = {
         success: !scanResult.isInfected,
+        requestId,
         message: scanResult.isInfected ? 'File is infected' : 'File is clean and safe',
         infected: scanResult.isInfected,
         scanEnabled: true,
@@ -317,20 +517,27 @@ app.post('/upload', upload.single('document'), async (req, res) => {
         fileSize: fileSize,
         fileSizeFormatted: formatFileSize(fileSize),
         // Performance metrics
-        streamProcessingTime: scanResult.streamProcessingTime || 0,
-        streamProcessingTimeFormatted: formatDuration(scanResult.streamProcessingTime || 0),
-        scanDuration: scanResult.scanDuration,
-        scanDurationFormatted: formatDuration(scanResult.scanDuration),
-        totalDuration: scanResult.totalDuration || scanResult.scanDuration,
-        totalDurationFormatted: formatDuration(scanResult.totalDuration || scanResult.scanDuration)
+        uploadDuration: uploadDuration,
+        uploadDurationFormatted: formatDuration(uploadDuration),
+        scanDuration: scanResult.scanDuration || 0,
+        scanDurationFormatted: formatDuration(scanResult.scanDuration || 0),
+        totalDuration: totalRequestDuration,
+        totalDurationFormatted: formatDuration(totalRequestDuration)
       };
 
       if (scanResult.isInfected) {
         responseData.viruses = scanResult.viruses;
-        console.log(`File infected: ${req.file.originalname} (${formatFileSize(fileSize)}) - Stream: ${formatDuration(scanResult.streamProcessingTime || 0)}, Scan: ${formatDuration(scanResult.scanDuration)}, Total: ${formatDuration(scanResult.totalDuration || scanResult.scanDuration)}`);
+        log('warn', '⚠️  File is infected', {
+          fileName: req.file.originalname,
+          viruses: scanResult.viruses,
+          totalDuration: formatDuration(totalRequestDuration)
+        });
         return res.status(400).json(responseData);
       } else {
-        console.log(`File clean: ${req.file.originalname} (${formatFileSize(fileSize)}) - Stream: ${formatDuration(scanResult.streamProcessingTime || 0)}, Scan: ${formatDuration(scanResult.scanDuration)}, Total: ${formatDuration(scanResult.totalDuration || scanResult.scanDuration)}`);
+        log('log', '✅ File is clean - sending success response', {
+          fileName: req.file.originalname,
+          totalDuration: formatDuration(totalRequestDuration)
+        });
         return res.status(200).json(responseData);
       }
     } else {
@@ -373,13 +580,41 @@ app.post('/upload', upload.single('document'), async (req, res) => {
       return res.status(200).json(responseData);
     }
   } catch (error) {
-    console.error('Processing error:', error);
+    const totalDuration = Date.now() - requestStartTime;
+    const errorDetails = {
+      error: error.message,
+      errorCode: error.code,
+      errorStack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+      totalDuration: formatDuration(totalDuration),
+      stage: 'processing_error'
+    };
     
-    return res.status(500).json({ 
-      success: false,
-      message: ENABLE_VIRUS_SCAN ? 'Error scanning file' : 'Error processing file',
-      error: error.message
-    });
+    log('error', '❌ Processing error occurred', errorDetails);
+    
+    // Determine error type and provide helpful message
+    let errorMessage = ENABLE_VIRUS_SCAN ? 'Error scanning file' : 'Error processing file';
+    let statusCode = 500;
+    
+    if (error.code === 'EPIPE' || error.code === 'ECONNRESET') {
+      errorMessage = 'Connection to virus scanner was lost. The file may be too large or the scanner may be overloaded. Please try again.';
+      statusCode = 503;
+      errorDetails.stage = 'connection_error';
+    } else if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
+      errorMessage = 'Scan operation timed out. Large files may take longer than expected. Please try again or contact support.';
+      statusCode = 504;
+      errorDetails.stage = 'timeout_error';
+    }
+    
+    if (!res.headersSent) {
+      return res.status(statusCode).json({ 
+        success: false,
+        requestId,
+        message: errorMessage,
+        ...errorDetails
+      });
+    } else {
+      log('error', '⚠️  Response already sent, cannot send error response');
+    }
   }
 });
 
