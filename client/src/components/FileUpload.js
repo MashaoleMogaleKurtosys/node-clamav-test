@@ -2,7 +2,21 @@ import React, { useState } from 'react';
 import axios from 'axios';
 import './FileUpload.css';
 
-const API_URL = process.env.REACT_APP_API_URL || 'http://127.0.0.1:3001';
+// Dynamically get API URL based on current hostname and port 3001
+const getApiUrl = () => {
+  if (process.env.REACT_APP_API_URL) {
+    return process.env.REACT_APP_API_URL;
+  }
+  
+  // Get current hostname and protocol
+  const protocol = window.location.protocol;
+  const hostname = window.location.hostname;
+  
+  // Always use port 3001
+  return `${protocol}//${hostname}:3001`;
+};
+
+const API_URL = getApiUrl();
 
 const FileUpload = () => {
   const [file, setFile] = useState(null);
