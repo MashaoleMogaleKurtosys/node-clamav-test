@@ -7,8 +7,11 @@ const { Readable } = require('stream');
 const app = express();
 const port = process.env.PORT || 3001;
 
-// Virus scanning feature flag (default: true for backward compatibility)
-const ENABLE_VIRUS_SCAN = true;
+// Virus scanning feature flag (default: true if env var not set)
+// Environment variables are always strings, so check for string 'false'
+const ENABLE_VIRUS_SCAN = process.env.ENABLE_VIRUS_SCAN 
+  ? process.env.ENABLE_VIRUS_SCAN.toLowerCase() !== 'false'
+  : true;
 
 // ClamAV connection settings (for Docker TCP connection)
 const CLAMAV_HOST ='127.0.0.1';
